@@ -80,9 +80,11 @@ Before a block is accepted, the verifier MUST collect the UTXO IDs from every im
 3. Its locktime is not after the block timestamp.
 4. No other import transaction in this block and no processing ancestor block names it.
 
+The builder writes the owner, amount, and source chain of each verified UTXO into the block's extra data, where atomic transactions live today. Execution and replay read them from there, never from shared memory.
+
 A block that fails these checks is not accepted. If the node lacks the source chain data, consensus retries verification when peers vote for the block, so the node catches up when the data arrives. This is the existing behavior for atomic imports. Bootstrapping nodes skip these checks, as they do today, because the network already accepted the block.
 
-At execution, `importUTXOs` MUST revert unless for every UTXO in the call either `msg.sender` equals the owner or the owner has set `setRemoteImport(true)`. Otherwise it credits each owner with the UTXO amount times `1e9` wei and emits `Imported`. Owner and amount come from the verifier's result for the block, not from a live shared memory read, so execution is deterministic. After the block executes, the node marks the credited UTXOs consumed in shared memory. A UTXO named by a reverted call stays unconsumed.
+At execution, `importUTXOs` MUST revert unless for every UTXO in the call either `msg.sender` equals the owner or the owner has set `setRemoteImport(true)`. Otherwise it credits each owner with the UTXO amount times `1e9` wei and emits `Imported`. Owner and amount come from the block's extra data, not from a live shared memory read, so execution is deterministic. After the block executes, the node marks the credited UTXOs consumed in shared memory. A UTXO named by a reverted call stays unconsumed.
 
 Funds always go to the owner. A third party cannot redirect them. Without the remote flag, a third party cannot import them at all, and the UTXOs wait in shared memory for the owner, as they do today.
 
@@ -121,7 +123,7 @@ Shared memory, the UTXO format, and the P-Chain and X-Chain import and export tr
 
 ### Replay and state sync
 
-Accepted blocks can be re-executed during bootstrap before the source chain data arrives. The existing shared memory removal markers keep a consumed UTXO from being recreated by a subsequently processed export. Imports replay from the block content alone, because the verifier fixed every owner and amount before acceptance.
+Accepted blocks can be re-executed during bootstrap before the source chain data arrives. The existing shared memory removal markers keep a consumed UTXO from being recreated by a subsequently processed export. Imports replay from the block content alone, because the block's extra data records every owner and amount.
 
 The precompile's only storage is the remote import flags, ordinary EVM state. State sync needs nothing else.
 
