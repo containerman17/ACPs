@@ -65,22 +65,20 @@ Amounts in shared memory are nAVAX. One nAVAX equals `1e9` wei. The `to` argumen
 
 ### Import
 
-An import is a transaction whose `to` is the precompile address and whose calldata calls `importUTXOs`. Internal calls to `importUTXOs` revert. Verification must see every import in the block, and it can only see direct calls.
+The block builder lists every UTXO that the block imports in the block's extra-data field, where atomic transactions live today. The list is sorted by `(sourceChainID, txID, outputIndex)`. Under SAE the verifier does not execute the block before voting, so this list is how it learns what the block consumes. Calls from any depth work, because the builder sees them during block building.
 
-Before a block is accepted, for each import transaction in the block the verifier MUST check:
+Before a block is accepted, for each listed UTXO the verifier MUST check:
 
 1. `sourceChainID` is the P-Chain or X-Chain of this network.
-2. The list is not empty, is sorted by `(txID, outputIndex)`, and has no duplicates.
-3. Each UTXO exists in shared memory for that source chain and holds a `secp256k1fx.TransferOutput` of the AVAX asset.
-4. Each UTXO has threshold one, one owner address, and that address equals the transaction sender.
-5. Each UTXO locktime is not after the block timestamp.
-6. Each `amount` equals the UTXO amount.
-7. No UTXO is consumed by an earlier transaction in this block or by any processing ancestor block.
-8. The transaction gas limit is not less than the import gas cost below.
+2. The list has no duplicates.
+3. The UTXO exists in shared memory for that source chain and holds a `secp256k1fx.TransferOutput` of the AVAX asset.
+4. The UTXO has threshold one and one owner address.
+5. The UTXO locktime is not after the block timestamp.
+6. No processing ancestor block lists the same UTXO.
 
 A block that fails these checks is not accepted. If the node lacks the source chain data, consensus retries verification when peers vote for the block, so the node catches up when the data arrives. This is the existing behavior for atomic imports.
 
-Execution credits the sender with the sum of `amount` times `1e9` wei, marks the UTXOs consumed in shared memory, and emits `Imported`. Execution MUST NOT read shared memory for anything the verifier did not already check. The call reverts only if the transaction runs out of gas. Revert leaves the UTXOs unconsumed.
+At execution, `importUTXOs` MUST revert unless every UTXO in the call is in the block's list, has not been credited earlier in the block, has owner equal to `msg.sender`, and has `amount` equal to the listed UTXO amount. The verifier already fixed the owner, amount, and locktime of each listed UTXO, so execution reads them from the block's verification result, not from live shared memory. A successful call credits `msg.sender` with the sum of `amount` times `1e9` wei and emits `Imported`. After the block executes, the node marks the credited UTXOs consumed in shared memory. A listed UTXO that no call credits stays unconsumed.
 
 ### Export
 
@@ -108,7 +106,7 @@ Shared memory, the UTXO format, and the P-Chain and X-Chain import and export tr
 
 ### Replay and state sync
 
-Accepted blocks can be re-executed during bootstrap before the source chain data arrives. The existing shared memory removal markers keep a consumed UTXO from being recreated by a subsequently processed export. Imports replay from the block content alone, because the verifier fixed every amount before acceptance.
+Accepted blocks can be re-executed during bootstrap before the source chain data arrives. The existing shared memory removal markers keep a consumed UTXO from being recreated by a subsequently processed export. Imports replay from the block content alone, because the block lists every UTXO and the verifier fixed its owner and amount before acceptance.
 
 The precompile has no storage. State sync needs nothing beyond ordinary EVM state.
 
@@ -119,8 +117,6 @@ These rules activate in the next C-Chain network upgrade. Before activation, cal
 ## Backwards Compatibility
 
 This proposal removes `ImportTx` and `ExportTx` from the C-Chain. Wallets and tools that build them must move to the precompile. Any UTXO exported to the C-Chain before activation stays importable through `importUTXOs`, because shared memory does not change.
-
-Smart contract wallets cannot import through an internal call in this version. The owner bytes in the UTXO must match an account that sends the transaction directly.
 
 X-Chain to C-Chain transfers are supported through the same functions. The X-Chain carries little traffic, so this is for completeness.
 
@@ -146,7 +142,6 @@ Removing atomic transactions removes an entire transaction format from the mempo
 
 1. Confirm the precompile address and the gas values against the implementation.
 2. Decide whether `avax.*` APIs are removed or kept read-only.
-3. Decide whether smart contract wallets get an import path in a later revision, for example a declared import list checked by the verifier.
 
 ## Copyright
 
