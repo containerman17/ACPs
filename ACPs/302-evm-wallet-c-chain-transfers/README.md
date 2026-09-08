@@ -15,7 +15,7 @@ After activation, the C-Chain rejects `ImportTx` and `ExportTx`. The P-Chain and
 
 ## Motivation
 
-Avalanche must support standard EVM wallet interfaces across its user operations. Today, moving AVAX between the C-Chain and the P-Chain requires an Avalanche-specific signer. Generic wallets and smart accounts cannot do it.
+The C-Chain is an EVM chain, but two of its operations are not EVM transactions. Export and import require an Avalanche-specific wallet. A user of a generic EVM wallet or a smart account cannot do them, so the C-Chain is not fully EVM compatible.
 
 The missing operations are:
 
