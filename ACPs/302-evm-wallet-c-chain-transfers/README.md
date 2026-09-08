@@ -78,7 +78,7 @@ Before a block is accepted, the verifier MUST collect the UTXO IDs from every im
 1. It exists in shared memory for the P-Chain or X-Chain of this network and holds a `secp256k1fx.TransferOutput` of the AVAX asset.
 2. It has threshold one and one owner address.
 3. Its locktime is not after the block timestamp.
-4. No other import transaction in this block and no processing ancestor block names it.
+4. No other import transaction in this block and no processing ancestor block names it. A UTXO named by a reverted import therefore becomes importable again once that block settles.
 
 The builder writes the owner, amount, and source chain of each verified UTXO into the block's extra data, where atomic transactions live today. Execution and replay read them from there, never from shared memory.
 
@@ -137,7 +137,15 @@ Nodes that do not upgrade fail to verify blocks that contain imports. This is a 
 
 ## Reference Implementation
 
-The precompile is not implemented yet. An earlier prototype on the [`containerman17/cchain-evm-wallet`](https://github.com/ava-labs/avalanchego/tree/containerman17/cchain-evm-wallet) branch implements the export hook, the pre-acceptance UTXO check, and the replay tests with a Solidity helper and an atomic import transaction. The hook, the UTXO checks, and the shared memory handling carry over. The helper and the atomic transaction are replaced by the precompile.
+The [`containerman17/cchain-evm-wallet`](https://github.com/ava-labs/avalanchego/tree/containerman17/cchain-evm-wallet) branch of AvalancheGo implements this proposal in the SAE C-Chain:
+
+- `vms/saevm/cchain/crosschain`: the precompile, its ABI, gas charges, and the per-block table of verified imports.
+- `vms/saevm/cchain/hooks.go`: the transaction filter that checks import calldata against shared memory before a block is built or verified, the extra-data import records, the export debit, and the shared-memory writes after execution.
+- `vms/saevm/cchain/tx/extdata.go`: the extra-data encoding with import records, versioned so pre-existing blocks parse unchanged.
+- `vms/saevm/cchain/crosschain_test.go`: export, owner import, refused and allowed remote import, verification failure without the UTXO, and replay on live and bootstrapping nodes.
+- `tests/e2e/c/evm_wallet_transfers.go`: a network test that exports from the C-Chain with the precompile, imports on the P-Chain, exports back to the EVM address, and imports with the precompile.
+
+The atomic `ImportTx` and `ExportTx` still work on the branch. Their removal is a later upgrade.
 
 ## Security Considerations
 
