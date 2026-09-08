@@ -42,43 +42,45 @@ A native precompile at `0x0200000000000000000000000000000000000007` with this in
 
 ```solidity
 interface ICrossChainTransfer {
-    struct UTXO {
+    struct UTXOID {
         bytes32 txID;
         uint32 outputIndex;
-        uint64 amount;
     }
 
-    /// Credits msg.sender with the sum of `utxos` and consumes them.
-    /// `sourceChainID` is the P-Chain or X-Chain blockchain ID.
-    function importUTXOs(bytes32 sourceChainID, UTXO[] calldata utxos) external returns (uint256 amountWei);
+    /// Credits each UTXO to its owner and consumes it. Anyone can call this.
+    /// The caller pays gas. The owner receives the full amount.
+    function importUTXOs(UTXOID[] calldata utxos) external;
 
     /// Moves msg.value, in whole nAVAX, to shared memory as one UTXO owned by
     /// `to` on `destinationChainID`.
     function exportAVAX(bytes32 destinationChainID, address to) external payable;
 
-    event Imported(address indexed to, bytes32 indexed sourceChainID, uint256 amountWei);
+    event Imported(address indexed owner, bytes32 txID, uint32 outputIndex, uint64 amountNAVAX);
     event Exported(address indexed from, bytes32 indexed destinationChainID, address to, uint64 amountNAVAX);
 }
 ```
 
-Amounts in shared memory are nAVAX. One nAVAX equals `1e9` wei. The `to` argument holds the 20 owner bytes of a P-Chain or X-Chain address. Both functions accept only the AVAX asset.
+Amounts in shared memory are nAVAX. One nAVAX equals `1e9` wei. The `to` argument holds the 20 owner bytes of a P-Chain or X-Chain address. Both functions accept only the AVAX asset. Import takes no source chain argument. The node looks a UTXO ID up in the P-Chain store and then the X-Chain store.
 
 ### Import
 
-The block builder lists every UTXO that the block imports in the block's extra-data field, where atomic transactions live today. The list is sorted by `(sourceChainID, txID, outputIndex)`. Under SAE the verifier does not execute the block before voting, so this list is how it learns what the block consumes. Calls from any depth work, because the builder sees them during block building.
+An import transaction is just gas exchanged for funds that the source chain already decided to send. The call names UTXO IDs and nothing else. Owner, amount, and locktime come from the UTXO in shared memory. The caller does not need to own anything. The funds go to the UTXO owner, so a third party can import for a contract wallet or for another user and only spends its own gas.
 
-Before a block is accepted, for each listed UTXO the verifier MUST check:
+Under SAE, nodes vote on a block before executing it. The node must know which UTXOs a block imports without running its transactions. A transaction declares them in one of two places that the node can read directly:
 
-1. `sourceChainID` is the P-Chain or X-Chain of this network.
-2. The list has no duplicates.
-3. The UTXO exists in shared memory for that source chain and holds a `secp256k1fx.TransferOutput` of the AVAX asset.
-4. The UTXO has threshold one and one owner address.
-5. The UTXO locktime is not after the block timestamp.
-6. No processing ancestor block lists the same UTXO.
+1. **Direct call.** `to` is the precompile and the calldata is an `importUTXOs` call. The UTXO list in the calldata is the declaration.
+2. **Access list.** An [EIP-2930](https://eips.ethereum.org/EIPS/eip-2930) access list entry for the precompile address. Each storage key is `keccak256(txID || outputIndex)`. This lets a contract call `importUTXOs` from any depth, as long as the outer transaction declared the UTXOs.
 
-A block that fails these checks is not accepted. If the node lacks the source chain data, consensus retries verification when peers vote for the block, so the node catches up when the data arrives. This is the existing behavior for atomic imports.
+The block's imported UTXO set is the union of every transaction's declarations. Before a block is accepted, the verifier MUST check for each declared UTXO:
 
-At execution, `importUTXOs` MUST revert unless every UTXO in the call is in the block's list, has not been credited earlier in the block, has owner equal to `msg.sender`, and has `amount` equal to the listed UTXO amount. The verifier already fixed the owner, amount, and locktime of each listed UTXO, so execution reads them from the block's verification result, not from live shared memory. A successful call credits `msg.sender` with the sum of `amount` times `1e9` wei and emits `Imported`. After the block executes, the node marks the credited UTXOs consumed in shared memory. A listed UTXO that no call credits stays unconsumed.
+1. It exists in shared memory for the P-Chain or X-Chain of this network and holds a `secp256k1fx.TransferOutput` of the AVAX asset.
+2. It has threshold one and one owner address.
+3. Its locktime is not after the block timestamp.
+4. No other declaration in this block and no processing ancestor block declares it.
+
+A block that fails these checks is not accepted. If the node lacks the source chain data, consensus retries verification when peers vote for the block, so the node catches up when the data arrives. This is the existing behavior for atomic imports. Bootstrapping nodes skip these checks, as they do today, because the network already accepted the block.
+
+At execution, `importUTXOs` MUST revert if any UTXO in the call was not declared by the enclosing transaction. Otherwise it credits each UTXO's owner with its amount times `1e9` wei and emits `Imported`. Owner and amount come from the verifier's result for the block, not from a live shared memory read, so execution is deterministic. After the block executes, the node marks the credited UTXOs consumed in shared memory. A declared UTXO that no call credits stays unconsumed.
 
 ### Export
 
@@ -94,9 +96,10 @@ A forced transfer to the precompile address does not create an export. Only a su
 | :- | :- |
 | `importUTXOs` base | 20,000 |
 | Each imported UTXO | 5,000 |
+| Each declared UTXO in an access list | 1,900, the EIP-2930 storage key cost |
 | `exportAVAX` | 40,000 |
 
-Import gas covers one shared memory read and one consumption write for each UTXO. Export gas covers the UTXO write to shared memory and the shared memory index update. These values are proposed and MUST be reviewed against the reference implementation.
+Import gas covers one shared memory read and one consumption write for each UTXO. The direct-call declaration costs calldata gas only. Export gas covers the UTXO write to shared memory and the shared memory index update. These values are proposed and MUST be reviewed against the reference implementation.
 
 ### Removal of atomic transactions
 
@@ -106,7 +109,7 @@ Shared memory, the UTXO format, and the P-Chain and X-Chain import and export tr
 
 ### Replay and state sync
 
-Accepted blocks can be re-executed during bootstrap before the source chain data arrives. The existing shared memory removal markers keep a consumed UTXO from being recreated by a subsequently processed export. Imports replay from the block content alone, because the block lists every UTXO and the verifier fixed its owner and amount before acceptance.
+Accepted blocks can be re-executed during bootstrap before the source chain data arrives. The existing shared memory removal markers keep a consumed UTXO from being recreated by a subsequently processed export. Imports replay from the block content alone, because every transaction declares its UTXOs and the verifier fixed their owners and amounts before acceptance.
 
 The precompile has no storage. State sync needs nothing beyond ordinary EVM state.
 
@@ -118,6 +121,8 @@ These rules activate in the next C-Chain network upgrade. Before activation, cal
 
 This proposal removes `ImportTx` and `ExportTx` from the C-Chain. Wallets and tools that build them must move to the precompile. Any UTXO exported to the C-Chain before activation stays importable through `importUTXOs`, because shared memory does not change.
 
+MetaMask and the Safe app cannot set an access list today. They import through a direct call, which also covers funds owned by a contract wallet: any account imports them and the contract receives the full amount. A contract that must import inside its own transaction needs a sender that can set an access list. That path is specified now so wallets can adopt it without another upgrade.
+
 X-Chain to C-Chain transfers are supported through the same functions. The X-Chain carries little traffic, so this is for completeness.
 
 Nodes that do not upgrade fail to verify blocks that contain imports and fail to parse the new consensus rules. This is a required upgrade.
@@ -128,7 +133,9 @@ The precompile is not implemented yet. An earlier prototype on the [`containerma
 
 ## Security Considerations
 
-The verifier is the trust boundary. A UTXO that passes verification is credited at execution without a second look. The checks above must therefore be complete: existence, asset, owner, threshold, locktime, amount, and no double consumption within processing blocks.
+The verifier is the trust boundary. A UTXO that passes verification is credited at execution without a second look. The checks above must therefore be complete: existence, asset, threshold, locktime, and no double declaration within processing blocks.
+
+Anyone can import anyone's UTXOs. This is safe because the credit always goes to the UTXO owner and the caller pays all gas. There is no fee taken from the imported amount, so a third party cannot grief the owner with a high fee, unlike the atomic `ImportTx` where the transaction builder set the fee.
 
 Verification reads shared memory, which is written by the P-Chain and X-Chain. A node whose source chain lags cannot verify a block with imports until it catches up. Consensus retries the block, so this costs latency on that node, not safety. If many validators lag at once, C-Chain block acceptance slows until they catch up. This is the same dependency atomic imports have today.
 
