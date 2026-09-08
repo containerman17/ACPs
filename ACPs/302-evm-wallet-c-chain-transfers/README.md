@@ -52,18 +52,18 @@ interface ICrossChainTransfer {
     /// Imports UTXOs on behalf of their owners. Direct calls only. Each UTXO
     /// is credited to its owner, who must have allowed remote imports. The
     /// caller pays gas and receives nothing.
-    function importForOwners(UTXOID[] calldata utxos) external;
+    function remoteImportUTXOs(UTXOID[] calldata utxos) external;
 
     /// msg.sender allows or forbids anyone to import its UTXOs with
-    /// importForOwners. Callable from any depth. Default is forbidden.
-    function setRemoteImport(bool allowed) external;
+    /// remoteImportUTXOs. Callable from any depth. Default is forbidden.
+    function allowRemoteImport(bool allowed) external;
 
     /// Moves msg.value, in whole nAVAX, to shared memory as one UTXO owned by
     /// `to` on `destinationChainID`. Callable from any depth.
     function exportAVAX(bytes32 destinationChainID, address to) external payable;
 
     event Imported(address indexed recipient, bytes32 txID, uint32 outputIndex, uint64 amountNAVAX);
-    event RemoteImportSet(address indexed owner, bool allowed);
+    event RemoteImportAllowed(address indexed owner, bool allowed);
     event Exported(address indexed from, bytes32 indexed destinationChainID, address to, uint64 amountNAVAX);
 }
 ```
@@ -74,7 +74,7 @@ Amounts in shared memory are nAVAX. One nAVAX equals `1e9` wei. All functions ac
 
 An import is gas exchanged for funds the source chain already decided to send. The call names UTXO IDs and nothing else. Owner, amount, and locktime come from the UTXO in shared memory.
 
-There are two import calls. `importUTXOs` is the owner importing its own UTXOs. The owner picks the recipient, as the signer of an `ImportTx` does today. `importForOwners` is anyone importing for owners that opted in. The funds go to the owners. The caller only pays gas, so a third party can import for a contract wallet or for another user without touching the funds.
+There are two import calls. `importUTXOs` is the owner importing its own UTXOs. The owner picks the recipient, as the signer of an `ImportTx` does today. `remoteImportUTXOs` is anyone importing for owners that opted in. The funds go to the owners. The caller only pays gas, so a third party can import for a contract wallet or for another user without touching the funds.
 
 An import transaction has `to` equal to the precompile address and calldata that calls one of the two. Internal calls to either revert. This is what lets the verifier see every import without executing: the UTXO list is in the calldata of a transaction addressed to the precompile.
 
@@ -89,7 +89,7 @@ The builder writes the owner, amount, and source chain of each verified UTXO int
 
 A block that fails these checks is not accepted. If the node lacks the source chain data, consensus retries verification when peers vote for the block, so the node catches up when the data arrives. This is the existing behavior for atomic imports. Bootstrapping nodes skip these checks, as they do today, because the network already accepted the block.
 
-At execution, `importUTXOs` MUST revert unless `msg.sender` owns every UTXO in the call, and then credits `to`. `importForOwners` MUST revert unless every owner has set `setRemoteImport(true)`, and then credits each owner. The credit is the UTXO amount times `1e9` wei, with one `Imported` event per UTXO. Owner and amount come from the block's extra data, not from a live shared memory read, so execution is deterministic. After the block executes, the node marks the credited UTXOs consumed in shared memory. A UTXO named by a reverted call stays unconsumed.
+At execution, `importUTXOs` MUST revert unless `msg.sender` owns every UTXO in the call, and then credits `to`. `remoteImportUTXOs` MUST revert unless every owner has set `allowRemoteImport(true)`, and then credits each owner. The credit is the UTXO amount times `1e9` wei, with one `Imported` event per UTXO. Owner and amount come from the block's extra data, not from a live shared memory read, so execution is deterministic. After the block executes, the node marks the credited UTXOs consumed in shared memory. A UTXO named by a reverted call stays unconsumed.
 
 Only the owner can redirect funds. A third party cannot, and without the remote flag cannot import them at all. The UTXOs then wait in shared memory for the owner, as they do today.
 
@@ -97,7 +97,7 @@ UTXOs with a threshold above one or more than one owner address fail verificatio
 
 ### Remote import flag
 
-`setRemoteImport` writes one boolean in the precompile's storage under `msg.sender`. It needs no verification input, so it works from any call depth. A contract wallet sets it once and any account can then call `importForOwners` for the contract's UTXOs, which land on the contract.
+`allowRemoteImport` writes one boolean in the precompile's storage under `msg.sender`. It needs no verification input, so it works from any call depth. A contract wallet sets it once and any account can then call `remoteImportUTXOs` for the contract's UTXOs, which land on the contract.
 
 ### Export
 
@@ -111,12 +111,12 @@ A forced transfer to the precompile address does not create an export. Only a su
 
 | Operation | Gas |
 | :- | :- |
-| `importUTXOs` or `importForOwners` base | 20,000 |
+| `importUTXOs` or `remoteImportUTXOs` base | 20,000 |
 | Each imported UTXO | 5,000 |
-| `setRemoteImport` | 20,000 |
+| `allowRemoteImport` | 20,000 |
 | `exportAVAX` | 40,000 |
 
-Import gas covers one shared memory read and one consumption write for each UTXO. `setRemoteImport` is one storage write. Export gas covers the UTXO write to shared memory and the shared memory index update. These values are proposed and MUST be reviewed against the reference implementation.
+Import gas covers one shared memory read and one consumption write for each UTXO. `allowRemoteImport` is one storage write. Export gas covers the UTXO write to shared memory and the shared memory index update. These values are proposed and MUST be reviewed against the reference implementation.
 
 An import cannot pay for its own gas. Under ACP-194 the sender must cover gas from its balance at admission, and the credit lands at execution.
 
@@ -138,7 +138,7 @@ The precompile's only storage is the remote import flags, ordinary EVM state. St
 
 Wallets that export to the C-Chain must set the UTXO owner to the receiving EVM address. Exports that still use the P-style owner remain importable through `ImportTx` during the transition period.
 
-MetaMask and similar wallets import with one direct call. A Safe or other contract wallet sets the remote flag once from inside a contract transaction, and any account can then import for it with `importForOwners`. No access list or other transaction field that wallets do not support is needed.
+MetaMask and similar wallets import with one direct call. A Safe or other contract wallet sets the remote flag once from inside a contract transaction, and any account can then import for it with `remoteImportUTXOs`. No access list or other transaction field that wallets do not support is needed.
 
 Nodes that do not upgrade fail to verify blocks that contain imports. This is a required upgrade.
 
