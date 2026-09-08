@@ -28,7 +28,7 @@ The atomic transaction format is the only reason the C-Chain needs a second tran
 
 ### Background
 
-The P-Chain, X-Chain, and C-Chain exchange AVAX through shared memory. An export creates an unspent transaction output, or UTXO, in that store. An import consumes the UTXO and credits funds on the destination chain.
+The P-Chain, X-Chain, and C-Chain exchange AVAX through shared memory. An export creates a UTXO there. An import consumes it.
 
 Under [ACP-194](../194-continuous-execution/README.md), consensus accepts C-Chain blocks before execution. A block is verified before acceptance and executed after. Anything execution reads must be fixed at verification, or nodes can compute different state roots.
 
