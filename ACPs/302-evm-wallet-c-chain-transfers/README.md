@@ -7,59 +7,41 @@
 
 ## Abstract
 
-The C-Chain is an EVM chain, but its imports and exports are atomic transactions, not EVM transactions. A generic EVM wallet cannot sign them.
-
-This ACP adds a precompile. An EVM transaction that calls it is the import or the export. The block verifier checks that imported UTXOs exist before the block is accepted, and execution credits their owners. The atomic `ImportTx` and `ExportTx` stay for a transition period and are removed by a later upgrade.
+C-Chain imports and exports are atomic transactions, not EVM transactions, so a generic EVM wallet cannot make them. This ACP adds a precompile. An EVM transaction that calls it is the import or the export. The block verifier checks imported UTXOs in shared memory before the block is accepted, and execution credits them from data recorded in the block. `ImportTx` and `ExportTx` stay for a transition period and are removed by a later upgrade.
 
 ## Motivation
 
-The C-Chain is an EVM chain, but two of its operations are not EVM transactions. Export and import require an Avalanche-specific wallet. A user of a generic EVM wallet or a smart account cannot do them, so the C-Chain is not fully EVM compatible.
-
-The missing operations are:
-
-- Export AVAX from a C-Chain account to a P-Chain or X-Chain address.
-- Import AVAX that a P-Chain or X-Chain transaction exported to a C-Chain account.
-
-Staking, delegation, and validator funding are uses of these transfers. This ACP changes the C-Chain half of each transfer. P-Chain imports and exports through EVM wallet interfaces are a subsequent step.
-
-The atomic transaction format is the only reason the C-Chain has a second transaction type, a second signature scheme, a second mempool path, and a second gas model. One precompile makes all of them removable.
+The C-Chain is not fully EVM compatible: moving AVAX to or from the P-Chain needs an Avalanche-specific wallet. Generic wallets and smart accounts cannot stake, delegate, or fund validators. The atomic transaction format is also the only reason the C-Chain carries a second transaction type, signature scheme, mempool path, and gas model.
 
 ### Background
 
-The P-Chain, X-Chain, and C-Chain exchange AVAX through shared memory. An export creates a UTXO there. An import consumes it. A UTXO exported to the C-Chain names 20 owner bytes. Today those bytes are usually the P-style address of a key, `ripemd160(sha256(pubkey))`, and the atomic `ImportTx` signature picks the EVM destination. With this ACP, exports name the EVM address of the receiving account as the owner.
+A UTXO exported to the C-Chain names 20 owner bytes. Today those are usually a key's P-style address, and the `ImportTx` signature picks the EVM destination. With this ACP, exports name the receiving EVM address.
 
-Under [ACP-194](../194-continuous-execution/README.md), consensus accepts C-Chain blocks before execution. A block is verified before acceptance and executed after. The verifier does not run transactions. Anything execution depends on from outside the EVM must be checked at verification from data the verifier can read directly.
-
-Exports already reach shared memory through an execution hook. Imports are the harder direction, because the C-Chain must know that the UTXOs exist before it accepts a block that spends them.
+Under [ACP-194](../194-continuous-execution/README.md), blocks are verified before acceptance and executed after, and the verifier does not run transactions. Anything execution needs from outside the EVM must be checked at verification from data the verifier can read directly, and recorded in the block so replay never reads shared memory.
 
 ## Specification
 
 ### Precompile
 
-A native precompile at `0x0200000000000000000000000000000000000007`:
+Address `0x0200000000000000000000000000000000000007`:
 
 ```solidity
 interface ICrossChainTransfer {
-    struct UTXOID {
-        bytes32 txID;
-        uint32 outputIndex;
-    }
+    struct UTXOID { bytes32 txID; uint32 outputIndex; }
 
-    /// Imports msg.sender's own UTXOs and credits `to`. Direct calls only.
-    /// Reverts if msg.sender does not own every UTXO.
+    /// msg.sender imports its own UTXOs and credits `to`. Direct calls only.
     function importUTXOs(UTXOID[] calldata utxos, address to) external;
 
-    /// Imports UTXOs on behalf of their owners. Direct calls only. Each UTXO
-    /// is credited to its owner, who must have allowed remote imports. The
-    /// caller pays gas and receives nothing.
+    /// Anyone imports UTXOs whose owners allowed it. Each owner is credited.
+    /// Direct calls only.
     function remoteImportUTXOs(UTXOID[] calldata utxos) external;
 
-    /// msg.sender allows or forbids anyone to import its UTXOs with
-    /// remoteImportUTXOs. Callable from any depth. Default is forbidden.
+    /// msg.sender allows or forbids remoteImportUTXOs on its UTXOs.
+    /// Any call depth. Default is forbidden.
     function allowRemoteImport(bool allowed) external;
 
     /// Moves msg.value, in whole nAVAX, to shared memory as one UTXO owned by
-    /// `to` on `destinationChainID`. Callable from any depth.
+    /// `to` on `destinationChainID`. Any call depth.
     function exportAVAX(bytes32 destinationChainID, address to) external payable;
 
     event Imported(address indexed recipient, bytes32 txID, uint32 outputIndex, uint64 amountNAVAX);
@@ -68,44 +50,28 @@ interface ICrossChainTransfer {
 }
 ```
 
-Amounts in shared memory are nAVAX. One nAVAX equals `1e9` wei. All functions accept only the AVAX asset. The node looks a UTXO ID up in the P-Chain store and then the X-Chain store, so import takes no source chain argument.
+One nAVAX is `1e9` wei. Only AVAX is accepted. The node looks a UTXO ID up in the P-Chain store, then the X-Chain store.
 
 ### Import
 
-An import is gas exchanged for funds the source chain already decided to send. The call names UTXO IDs and nothing else. Owner, amount, and locktime come from the UTXO in shared memory.
+An import transaction has `to` equal to the precompile and calldata calling `importUTXOs` or `remoteImportUTXOs`. Internal calls to either revert. The UTXO list is therefore in the calldata, where the verifier can read it without executing.
 
-There are two import calls. `importUTXOs` is the owner importing its own UTXOs. The owner picks the recipient, as the signer of an `ImportTx` does today. `remoteImportUTXOs` is anyone importing for owners that opted in. The funds go to the owners. The caller only pays gas, so a third party can import for a contract wallet or for another user without touching the funds.
+Before a block is accepted, for every UTXO named by an import transaction the verifier MUST check:
 
-An import transaction has `to` equal to the precompile address and calldata that calls one of the two. Internal calls to either revert. This is what lets the verifier see every import without executing: the UTXO list is in the calldata of a transaction addressed to the precompile.
-
-Before a block is accepted, the verifier MUST collect the UTXO IDs from every import transaction in the block and check for each one:
-
-1. It exists in shared memory for the P-Chain or X-Chain of this network and holds a `secp256k1fx.TransferOutput` of the AVAX asset.
+1. It exists in shared memory for the P-Chain or X-Chain of this network and is a `secp256k1fx.TransferOutput` of AVAX.
 2. It has threshold one and one owner address.
 3. Its locktime is not after the block timestamp.
-4. No other import transaction in this block and no processing ancestor block names it. A UTXO named by a reverted import therefore becomes importable again once that block settles.
+4. No other import transaction in this block and no processing ancestor block names it.
 
-The builder writes the owner, amount, and source chain of each verified UTXO into the block's extra data, where atomic transactions live today. Execution and replay read them from there, never from shared memory.
+The builder records owner, amount, and source chain of each UTXO in the block's extra data, where atomic transactions live today. A block that fails a check is not accepted. A node that lacks the source chain data retries verification when peers vote for the block, as with atomic imports today. Bootstrapping nodes skip the checks, as today.
 
-A block that fails these checks is not accepted. If the node lacks the source chain data, consensus retries verification when peers vote for the block, so the node catches up when the data arrives. This is the existing behavior for atomic imports. Bootstrapping nodes skip these checks, as they do today, because the network already accepted the block.
+At execution, `importUTXOs` MUST revert unless `msg.sender` owns every UTXO, and then credits `to`. `remoteImportUTXOs` MUST revert unless every owner has called `allowRemoteImport(true)`, and then credits each owner. Owner and amount come from the block's extra data. The credit is the amount times `1e9` wei, with one `Imported` event per UTXO. After the block executes, the node marks credited UTXOs consumed in shared memory. A UTXO named by a reverted call stays unconsumed and, by rule 4, becomes importable again when that block settles.
 
-At execution, `importUTXOs` MUST revert unless `msg.sender` owns every UTXO in the call, and then credits `to`. `remoteImportUTXOs` MUST revert unless every owner has set `allowRemoteImport(true)`, and then credits each owner. The credit is the UTXO amount times `1e9` wei, with one `Imported` event per UTXO. Owner and amount come from the block's extra data, not from a live shared memory read, so execution is deterministic. After the block executes, the node marks the credited UTXOs consumed in shared memory. A UTXO named by a reverted call stays unconsumed.
-
-Only the owner can redirect funds. A third party cannot, and without the remote flag cannot import them at all. The UTXOs then wait in shared memory for the owner, as they do today.
-
-UTXOs with a threshold above one or more than one owner address fail verification. The precompile has no signature path for them, so they stay in shared memory. During the transition they import through `ImportTx` as today. After activation, the P-Chain MUST reject an export to the C-Chain whose output is not a single-owner, threshold-one transfer output, so no new such UTXOs are created.
-
-### Remote import flag
-
-`allowRemoteImport` writes one boolean in the precompile's storage under `msg.sender`. It needs no verification input, so it works from any call depth. A contract wallet sets it once and any account can then call `remoteImportUTXOs` for the contract's UTXOs, which land on the contract.
+UTXOs with more than one owner or a threshold above one fail rule 2 and stay in shared memory. During the transition they import through `ImportTx`. After activation, the P-Chain MUST reject an export to the C-Chain whose output is not a single-owner, threshold-one transfer output.
 
 ### Export
 
-`exportAVAX` MUST revert if `msg.value` is zero, is not a whole number of nAVAX, or exceeds `uint64` nAVAX. It MUST revert if `destinationChainID` is not the P-Chain or X-Chain of this network. It works from any call depth, because the export needs no verification input.
-
-The value stays at the precompile address. After the block executes, the node writes one UTXO to shared memory for the destination chain: owner `to`, threshold one, the amount in nAVAX, no locktime. The UTXO ID is derived from the transaction hash and the log index of the `Exported` event, so historical execution reproduces it.
-
-A forced transfer to the precompile address does not create an export. Only a successful `exportAVAX` call does.
+`exportAVAX` MUST revert if `msg.value` is zero, not a whole number of nAVAX, or above `uint64` nAVAX, or if `destinationChainID` is not the P-Chain or X-Chain. The value stays at the precompile address, which has no code path to release it. After the block executes, the node writes one UTXO to shared memory for the destination chain: owner `to`, threshold one, the amount in nAVAX, no locktime. The UTXO ID is the transaction hash and the log index of the `Exported` event. A forced transfer to the precompile address does not create an export.
 
 ### Gas
 
@@ -116,62 +82,32 @@ A forced transfer to the precompile address does not create an export. Only a su
 | `allowRemoteImport` | 20,000 |
 | `exportAVAX` | 40,000 |
 
-Import gas covers one shared memory read and one consumption write for each UTXO. `allowRemoteImport` is one storage write. Export gas covers the UTXO write to shared memory and the shared memory index update. These values are proposed and MUST be reviewed against the reference implementation.
+Import gas covers one shared memory read and one consumption write per UTXO. Export gas covers the UTXO write and the shared memory index update. An import cannot pay for its own gas: under ACP-194 the sender covers gas at admission and the credit lands at execution.
 
-An import cannot pay for its own gas. Under ACP-194 the sender must cover gas from its balance at admission, and the credit lands at execution.
+### Transition
 
-### Transition and removal of atomic transactions
+The precompile activates in the next C-Chain upgrade. `ImportTx` and `ExportTx` keep their rules during a transition period, so UTXOs exported with P-style owners before wallets update stay importable. A later upgrade removes both from the mempool and from blocks. That upgrade MAY return any UTXO still in shared memory to the P-Chain side of its owner, since the owner bytes are a P-Chain address for the same key.
 
-The precompile activates in the next C-Chain network upgrade. `ImportTx` and `ExportTx` keep their current rules during a transition period, so UTXOs with P-style owners exported before wallets update stay importable the old way.
-
-A later upgrade removes `ImportTx` and `ExportTx` from the mempool and from blocks. That upgrade MAY return any UTXO still in shared memory to the P-Chain side of its owner, since the owner bytes are a valid P-Chain address for the same key. No funds are lost by the removal.
-
-Shared memory, the UTXO format, and the import and export transaction formats of the P-Chain and X-Chain do not change. The only new source-chain rule is the single-owner output requirement above for exports to the C-Chain.
-
-### Replay and state sync
-
-Accepted blocks can be re-executed during bootstrap before the source chain data arrives. The existing shared memory removal markers keep a consumed UTXO from being recreated by a subsequently processed export. Imports replay from the block content alone, because the block's extra data records every owner and amount.
-
-The precompile's only storage is the remote import flags, ordinary EVM state. State sync needs nothing else.
+Shared memory, the UTXO format, and the P-Chain and X-Chain transaction formats do not change, apart from the single-owner export rule above. Replay and state sync need nothing new: imports replay from the block, consumed UTXOs are protected by the existing shared memory removal markers, and the precompile's only storage is the remote import flags.
 
 ## Backwards Compatibility
 
-Wallets that export to the C-Chain must set the UTXO owner to the receiving EVM address. Exports that still use the P-style owner remain importable through `ImportTx` during the transition period.
-
-MetaMask and similar wallets import with one direct call. A Safe or other contract wallet sets the remote flag once from inside a contract transaction, and any account can then import for it with `remoteImportUTXOs`. No access list or other transaction field that wallets do not support is needed.
-
-Nodes that do not upgrade fail to verify blocks that contain imports. This is a required upgrade.
+Wallets exporting to the C-Chain must name the receiving EVM address as owner. MetaMask and similar wallets import with one direct call. A Safe or other contract wallet calls `allowRemoteImport(true)` once from a contract transaction, after which any account can import for it with `remoteImportUTXOs`. Nodes that do not upgrade fail to verify blocks with imports. This is a required upgrade.
 
 ## Reference Implementation
 
-The [`containerman17/cchain-evm-wallet`](https://github.com/ava-labs/avalanchego/tree/containerman17/cchain-evm-wallet) branch of AvalancheGo implements this proposal in the SAE C-Chain:
-
-- `vms/saevm/cchain/crosschain`: the precompile, its ABI, gas charges, and the per-block table of verified imports.
-- `vms/saevm/cchain/hooks.go`: the transaction filter that checks import calldata against shared memory before a block is built or verified, the extra-data import records, the export debit, and the shared-memory writes after execution.
-- `vms/saevm/cchain/tx/extdata.go`: the extra-data encoding with import records, versioned so pre-existing blocks parse unchanged.
-- `vms/saevm/cchain/crosschain_test.go`: export, owner import, refused and allowed remote import, verification failure without the UTXO, and replay on live and bootstrapping nodes.
-- `tests/e2e/c/evm_wallet_transfers.go`: a network test that exports from the C-Chain with the precompile, imports on the P-Chain, exports back to the EVM address, and imports with the precompile.
-
-The atomic `ImportTx` and `ExportTx` still work on the branch. Their removal is a later upgrade.
+The [`containerman17/cchain-evm-wallet`](https://github.com/ava-labs/avalanchego/tree/containerman17/cchain-evm-wallet) branch of AvalancheGo implements this in the SAE C-Chain: the precompile in `vms/saevm/cchain/crosschain`, the verifier filter and extra-data records in `vms/saevm/cchain/hooks.go`, unit tests covering export, owner and remote import, refused imports, and replay on live and bootstrapping nodes, and an e2e test that round-trips AVAX between the C-Chain and P-Chain with ordinary EVM transactions.
 
 ## Security Considerations
 
-The verifier is the trust boundary. A UTXO that passes verification is credited at execution without a second look. The checks above must therefore be complete: existence, asset, threshold, locktime, and no double consumption within processing blocks.
+The verifier is the trust boundary. A UTXO that passes verification is credited at execution without a second look, so the four checks must be complete. Verification reads shared memory, which the P-Chain and X-Chain write. A lagging node cannot verify a block with imports until it catches up, and if many validators lag, block acceptance slows. This is the dependency atomic imports have today. Execution never reads shared memory, so nodes with different shared memory contents compute the same state root.
 
-Verification reads shared memory, which is written by the P-Chain and X-Chain. A node whose source chain lags cannot verify a block with imports until it catches up. Consensus retries the block, so this costs latency on that node, not safety. If many validators lag at once, C-Chain block acceptance slows until they catch up. This is the same dependency atomic imports have today.
-
-Execution never reads shared memory. Two nodes with different shared memory contents at execution time compute the same state root, because the block content fixed every owner and amount.
-
-Only the owner chooses the recipient, and the caller pays all gas. A third party cannot redirect funds and cannot charge a fee from the imported amount. This removes the fee griefing possible with `ImportTx`, where the transaction builder set the fee. A third party can import only for owners that opted in, and only to those owners.
-
-An export that names owner bytes no key controls burns the funds. This is true today. Wallets prevent it by filling the owner from the receiving account.
-
-Export funds stay at the precompile address, which has no code path to release them. A balance shortfall cannot occur, because the value arrives with the call.
+Only the owner chooses the recipient, and the caller pays all gas. A third party cannot redirect funds, cannot take a fee from them, and can import only for owners that opted in. This removes the fee griefing possible with `ImportTx`, where the transaction builder set the fee. An export naming owner bytes no key controls burns the funds, as today.
 
 ## Open Questions
 
-1. Confirm the precompile address and the gas values against the implementation.
-2. Set the length of the transition period before `ImportTx` and `ExportTx` are removed.
+1. Confirm the precompile address and gas values against the implementation.
+2. Set the length of the transition period.
 
 ## Copyright
 
