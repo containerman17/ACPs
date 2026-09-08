@@ -28,6 +28,8 @@ Staking, delegation, and validator funding are uses of these transfers. This ACP
 
 An exported UTXO alone does not authorize an import. The owner chooses the inputs and fee through an EVM contract call. The helper fixes the recipient to that owner. A submitter can send this same import, but cannot increase its fee or redirect its funds.
 
+The EVM call records the owner's decision using the account's existing authorization mechanism. Binding the complete import prevents a submitter from changing the recipient, input set, or fee.
+
 ### Background
 
 The P-Chain and C-Chain exchange AVAX through shared memory. An export creates an unspent transaction output, or UTXO, in that store. An import consumes the UTXO and credits funds on the destination chain.
@@ -40,8 +42,6 @@ Exports use the Warp precompile from [ACP-30](../30-avalanche-warp-x-evm/README.
 
 ## Specification
 
-MUST and MUST NOT specify requirements. MAY permits optional behavior. This draft leaves activation and deployment decisions under [Open questions](#open-questions). Those decisions must be complete before activation.
-
 ### Scope and units
 
 The new path supports AVAX transfers between the C-Chain and P-Chain. Each import spends UTXOs with one owner and credits that owner's C-Chain account. X-Chain transfers, other assets, and other recipients are outside this proposal.
@@ -52,83 +52,28 @@ The helper identifies the importing account through `msg.sender`. An EOA calls t
 
 ### Helper contract
 
-The network specifies one `CChainHelper` contract. The full source below matches [the prototype at commit `16c540e1f2`](https://github.com/ava-labs/avalanchego/blob/16c540e1f2d9420e02f9fe4912fe8c4912ef6d37/tests/cchainhelper/CChainHelper.sol).
+The network specifies one `CChainHelper` contract with this interface. The full source is in [CChainHelper.sol](./CChainHelper.sol) beside this document and matches [the prototype at commit `16c540e1f2`](https://github.com/ava-labs/avalanchego/blob/16c540e1f2d9420e02f9fe4912fe8c4912ef6d37/tests/cchainhelper/CChainHelper.sol).
 
 ```solidity
-// SPDX-License-Identifier: BSD-3-Clause
-pragma solidity ^0.8.28;
-
-interface IWarpMessenger {
-    function sendWarpMessage(bytes calldata payload) external returns (bytes32 messageID);
-    function getBlockchainID() external view returns (bytes32 blockchainID);
-}
-
-/// Moves AVAX between the C-chain and the P-chain for any EVM wallet with
-/// ordinary EVM transactions. The C-chain trusts this contract to bind import
-/// approvals and export messages to the caller.
-contract CChainHelper {
-    IWarpMessenger private constant WARP = IWarpMessenger(0x0200000000000000000000000000000000000005);
-
-    uint16 private constant CODEC_VERSION = 0;
-    uint32 private constant TYPE_TRANSFER_INPUT = 5;
-    /// C-chain atomic tx codec (vms/saevm/cchain/tx).
-    uint32 private constant C_TYPE_IMPORT = 0;
-
-    // Consensus reads this mapping directly. Keep it at storage slot 0.
-    mapping(bytes32 => bool) public authorized;
-
-    event ImportAuthorized(bytes32 indexed importHash, bytes unsignedTx);
-
+interface ICChainHelper {
     struct UTXO {
         bytes32 txID;
         uint32 outputIndex;
         uint64 amount;
     }
 
-    error BadAmount();
-    error InputsNotSorted();
+    event ImportAuthorized(bytes32 indexed importHash, bytes unsignedTx);
 
-    /// Exports msg.value (whole nAVAX) to the P-chain as a UTXO owned by [to],
-    /// any 20-byte P-chain address. The AVAX stays here until the SAE hook
-    /// reads the warp log (to || nAVAX), debits this contract and writes the
-    /// UTXO into shared memory.
-    function exportToP(address to) external payable returns (bytes32) {
-        if (msg.value == 0 || msg.value % 1e9 != 0 || msg.value / 1e9 > type(uint64).max) revert BadAmount();
-        return WARP.sendWarpMessage(abi.encodePacked(to, uint64(msg.value / 1e9)));
-    }
+    /// Exports msg.value, in whole nAVAX, to the P-Chain as a UTXO owned by `to`.
+    function exportToP(address to) external payable returns (bytes32 messageID);
 
-    /// Authorizes an import of [imported] to msg.sender with [fee] nAVAX burned.
-    /// Anyone can submit the emitted ImportTx bytes with empty credentials.
-    /// The atomic verifier checks ownership and availability of the UTXOs.
-    /// Callers pass [imported] sorted and the network ID and AVAX asset ID of
-    /// the chain; wrong values fail the atomic verifier. This call does not
-    /// complete the import.
+    /// Authorizes an import of `imported` to msg.sender with `fee` nAVAX burned.
     function importFromP(uint32 networkID, bytes32 avaxAssetID, UTXO[] calldata imported, uint64 fee)
         external
-        returns (bytes32)
-    {
-        uint64 total;
-        bytes memory ins = abi.encodePacked(uint32(imported.length));
-        for (uint256 i = 0; i < imported.length; i++) {
-            if (i > 0 && !before(imported[i - 1], imported[i])) revert InputsNotSorted();
-            total += imported[i].amount;
-            ins = abi.encodePacked(
-                ins, imported[i].txID, imported[i].outputIndex, avaxAssetID, TYPE_TRANSFER_INPUT, imported[i].amount, uint32(1), uint32(0)
-            );
-        }
-        if (total <= fee) revert BadAmount();
-        bytes memory tx_ = abi.encodePacked(CODEC_VERSION, C_TYPE_IMPORT, networkID, WARP.getBlockchainID(), bytes32(0), ins);
-        tx_ = abi.encodePacked(tx_, uint32(1), msg.sender, total - fee, avaxAssetID);
-        bytes32 importHash = keccak256(tx_);
-        authorized[importHash] = true;
-        emit ImportAuthorized(importHash, tx_);
-        return importHash;
-    }
+        returns (bytes32 importHash);
 
-    function before(UTXO calldata a, UTXO calldata b) private pure returns (bool) {
-        if (a.txID != b.txID) return uint256(a.txID) < uint256(b.txID);
-        return a.outputIndex < b.outputIndex;
-    }
+    /// Consensus reads this mapping directly at storage slot 0.
+    function authorized(bytes32 importHash) external view returns (bool);
 }
 ```
 
@@ -279,7 +224,15 @@ Historical execution MUST reproduce the recorded balance changes without reading
 
 ### Activation and state recovery
 
-A coordinated upgrade activates these rules. Before activation, nodes MUST reject the new credential and MUST NOT process helper messages as exports. The activation plan MUST prevent successful helper calls before activation.
+These rules activate in the next C-Chain network upgrade. Parameters at activation:
+
+| Parameter | Value |
+| :- | :- |
+| Credential type ID | `10` |
+| Extra atomic gas for the approval read | `4,700` |
+| Helper address | Set per network at deployment |
+
+Before activation, nodes MUST reject the new credential and MUST NOT process helper messages as exports. The activation plan MUST prevent successful helper calls before activation.
 
 The upgrade must set the helper address, code, storage layout, and deployment transaction for each network. The contract has no constructor arguments, so one deployment transaction gives the same address on each network. Nodes MUST NOT select the helper through operator configuration.
 
@@ -287,17 +240,7 @@ Authorizations are ordinary contract storage. Restart, replay, and state sync pr
 
 A syncing implementation MUST make the required settled EVM state available before verifying new blocks. This proposal adds no authorization-history recovery mechanism. It does not complete or replace the C-Chain's general SAE state-sync implementation.
 
-## Rationale
-
-The EVM call records the owner's decision using the account's existing authorization mechanism. Binding the complete import prevents a submitter from changing the recipient, input set, or fee.
-
-Contract storage gives authorization the same persistence and state-root authentication as other EVM state. An empty credential selects the new verification rule. It carries no proof because the verifier already has the settled state.
-
-Permissionless submission keeps the existing atomic machinery for UTXO checks, conflict checks, fees, and consumption. The application can submit after the receipt without a second wallet confirmation. Mandatory node queues are not needed for block verification or authorization.
-
-The helper does not read live P-Chain data during EVM execution. Such a read could make an accepted block's result depend on that node's P-Chain progress. A subsequent atomic import preserves the existing separation between verification and execution.
-
-## Backwards compatibility
+## Backwards Compatibility
 
 The proposal changes C-Chain consensus rules and requires a coordinated upgrade. Existing `secp256k1fx` imports and exports keep their current rules. P-Chain consensus and transaction formats do not change.
 
@@ -305,7 +248,13 @@ Applications must supply the correct destination owner bytes. Generic EVM wallet
 
 Atomic transaction decoders must support the new credential. Execution clients must apply the export debit to reproduce the C-Chain state. No new consensus queue or required submission service is added.
 
-## Security considerations
+## Security Considerations
+
+Contract storage gives authorization the same persistence and state-root authentication as other EVM state. An empty credential selects the new verification rule. It carries no proof because the verifier already has the settled state.
+
+Permissionless submission keeps the existing atomic machinery for UTXO checks, conflict checks, fees, and consumption. The application can submit after the receipt without a second wallet confirmation. Mandatory node queues are not needed for block verification or authorization.
+
+The helper does not read live P-Chain data during EVM execution. Such a read could make an accepted block's result depend on that node's P-Chain progress. A subsequent atomic import preserves the existing separation between verification and execution.
 
 ### Authorization and fees
 
@@ -337,7 +286,7 @@ Missing P-Chain data, fees that are not sufficient, or mempool capacity can dela
 
 These rules do not wait for P-Chain data inside accepted-block execution. They do not guarantee uninterrupted C-Chain progress. Live verification depends on nodes processing the required P-Chain exports.
 
-## Reference implementation
+## Reference Implementation
 
 The [prototype branch](https://github.com/ava-labs/avalanchego/tree/containerman17/cchain-evm-wallet) implements contract calls for both transfer directions.
 
@@ -350,20 +299,19 @@ The main files are:
 - `vms/saevm/cchain/contract_import_test.go`
 - `evmwallet_demo/`
 
-The prototype uses contract-storage approvals, empty marker credentials, a settled-state read, and the block timestamp for import time locks. The demo application submits the atomic import after the EVM receipt. There is no mandatory node queue or approval cleanup.
+The prototype stores approvals in contract storage, uses empty marker credentials, reads settled state, and checks time locks against the block timestamp. The demo application submits the atomic import after the EVM receipt.
 
-The prototype is not prepared for network activation. It selects the helper through the node's `helper-address` configuration and has no activation gate for this proposal. Its C-Chain state-sync handler currently skips state sync. Approval storage does not supply that missing implementation.
+Tests cover fee and input binding, ownership, time locks, settlement, restart, duplicate spending, and replay with delayed P-Chain data.
 
-This revision changes the earlier prototype's helper bytecode and credential encoding. Existing demo networks need a new network, not an in-place binary replacement.
+The prototype selects the helper through the node's `helper-address` configuration. Production nodes must not do this, see [Open Questions](#open-questions).
 
-Tests cover fee and input binding, ownership, time locks, settlement, restart, duplicate spending, and replay with delayed P-Chain data. Network deployment, activation, and general state sync are not implemented or verified.
+## Open Questions
 
-## Open questions
-
-1. Specify activation and the helper's deployment method, address, code, storage layout, and deployment transaction for each network.
-2. Allocate the credential type ID and review the proposed gas charges against the final implementation.
-3. Specify how applications find an import's execution status from its atomic transaction ID.
+1. Specify the helper's deployment method, address, and deployment transaction for each network, and the activation gate that rejects helper calls before the upgrade.
+2. Complete C-Chain SAE state sync. The prototype skips it.
+3. Allocate the credential type ID and review the proposed gas charges against the final implementation.
+4. Specify how applications find an import's execution status from its atomic transaction ID.
 
 ## Copyright
 
-The Solidity source retains its [BSD-3-Clause license](https://github.com/ava-labs/avalanchego/blob/16c540e1f2d9420e02f9fe4912fe8c4912ef6d37/LICENSE). For the rest of this document, copyright and related rights are waived via [CC0](https://creativecommons.org/publicdomain/zero/1.0/).
+Copyright and related rights waived via [CC0](https://creativecommons.org/publicdomain/zero/1.0/).
